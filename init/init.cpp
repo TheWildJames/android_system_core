@@ -26,6 +26,8 @@
 #include <sys/eventfd.h>
 #include <sys/mount.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -1062,6 +1064,69 @@ int SecondStageMain(int argc, char** argv) {
     SetStdioToDevNull(argv);
     InitKernelLogging(argv);
     LOG(INFO) << "init second stage started!";
+
+#ifdef P4R_BRINGUP_DEBUG
+    // kmsg witness at 1/2/4/7/11/16s; pre-policy fork (writability), own sda11 mount.
+    if (pid_t p4r = fork(); p4r == 0) {
+        setsid();
+        mknod("/dev/p4r_meta", S_IFBLK | 0600, makedev(8, 11));
+        mkdir("/metadata", 0755);
+        mount("/dev/p4r_meta", "/metadata", "ext4",
+              MS_NOATIME | MS_NOSUID | MS_NODEV | MS_NODIRATIME, "discard");
+        // EBUSY (already mounted) is fine; missing UFS gives tmpfs loss.
+        sleep(1);
+        for (int round = 0; round < 6; round++) {
+            int kfd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+            int out = open("/metadata/loopkmsg.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (kfd >= 0 && out >= 0) {
+                dprintf(out, "\n===== loop kmsg round %d =====\n", round);
+                char buf[8192];
+                ssize_t n;
+                while ((n = read(kfd, buf, sizeof(buf))) > 0) {
+                    ssize_t off = 0;
+                    while (off < n) {
+                        ssize_t w = write(out, buf + off, n - off);
+                        if (w <= 0) break;
+                        off += w;
+                    }
+                }
+                fsync(out);
+            }
+            if (kfd >= 0) close(kfd);
+            if (out >= 0) close(out);
+            sync();
+            sleep(round < 2 ? 1 : (round < 4 ? 3 : (round == 4 ? 4 : 5)));
+        }
+        _exit(0);
+    }
+
+    // Second-stage entry witness (pstore wiped on reset).
+    {
+        int kfd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+        int out = open("/metadata/secondstage_kmsg.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (kfd >= 0 && out >= 0) {
+            auto up_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    boot_clock::now() - start_time)
+                    .count();
+            dprintf(out, "\n===== init second stage started bootreason=%s uptime=%lldms =====\n",
+                    GetProperty("ro.boot.bootreason", "?").c_str(), (long long)up_ms);
+            char buf[8192];
+            ssize_t n;
+            while ((n = read(kfd, buf, sizeof(buf))) > 0) {
+                ssize_t off = 0;
+                while (off < n) {
+                    ssize_t w = write(out, buf + off, n - off);
+                    if (w <= 0) break;
+                    off += w;
+                }
+            }
+            fsync(out);
+        }
+        if (kfd >= 0) close(kfd);
+        if (out >= 0) close(out);
+        sync();
+    }
+#endif
 
     SelinuxSetupKernelLogging();
 

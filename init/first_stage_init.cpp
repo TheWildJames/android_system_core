@@ -18,13 +18,17 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <string.h>
 #include <paths.h>
+#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -68,6 +72,101 @@ enum class BootMode {
     RECOVERY_MODE,
     CHARGER_MODE,
 };
+// p4rOS bringup debug: witness code compiles only when P4R_BRINGUP_DEBUG is
+// set (userdebug/eng via TARGET_GLOBAL_CFLAGS in rising_flame.mk). Release
+// (user) builds get no-op stubs, and every other device is unaffected since
+// the macro is never defined for them.
+#ifdef P4R_BRINGUP_DEBUG
+// Bootloader wipes pstore on reset, so persist kmsg to /metadata (UFS sda11).
+// No devtmpfs/proc/ueventd this early: own node, never mount /proc, fixed 8:11.
+static const char* P4rModeStr(const std::string& cmdline) {
+    if (cmdline.find("androidboot.mode=recovery") != std::string::npos) return "recovery";
+    if (cmdline.find("androidboot.mode=charger") != std::string::npos) return "charger";
+    return "normal";
+}
+
+// Mounts real sda11 (/metadata is tmpfs until init mounts it; writes there
+// would vanish) and append-opens the witness file. Retries ~8s for early-boot
+// races. ours=true only if WE mounted (never steal init's mount).
+static int P4rOpenWitness(const char* name, bool* ours) {
+    char path[64];
+    snprintf(path, sizeof(path), "/metadata/%s", name);
+    for (int i = 0; i < 8; i++) {
+        mknod("/dev/p4r_meta", S_IFBLK | 0600, makedev(8, 11));
+        mkdir("/metadata", 0755);
+        *ours = (mount("/dev/p4r_meta", "/metadata", "ext4",
+                       MS_NOATIME | MS_NOSUID | MS_NODEV | MS_NODIRATIME, "discard") == 0);
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) return fd;
+        sleep(1);
+    }
+    return -1;
+}
+
+static void P4rCloseWitness(int fd, bool ours) {
+    fsync(fd);
+    close(fd);
+    sync();
+    if (ours) umount("/metadata");
+}
+
+static void P4rWriteAll(int fd, const char* buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w <= 0) break;
+        off += w;
+    }
+}
+
+static void DumpFirstStageKmsg(const char* why, const char* mode) {
+    // Never wedge PID 1 on a stalled mount: child writes, parent waits ~2s max.
+    pid_t p4r = fork();
+    if (p4r != 0) {
+        if (p4r > 0) {
+            for (int i = 0; i < 20; i++) {
+                if (waitpid(p4r, nullptr, WNOHANG) == p4r) break;
+                usleep(100000);
+            }
+        }
+        return;
+    }
+    // Child: best-effort witness, then gone. Never returns to init flow.
+    bool ours = false;
+    int out = P4rOpenWitness("firststage_kmsg.txt", &ours);
+    if (out >= 0) {
+        dprintf(out, "\n===== first-stage[%s]: %s =====\n", mode, why);
+        P4rCloseWitness(out, ours);
+    }
+    _exit(0);
+}
+
+static void FirstStageCrashHandler(int sig) {
+    const char* why = "signal";
+    if (sig == SIGSEGV) why = "SIGSEGV";
+    else if (sig == SIGABRT) why = "SIGABRT";
+    else if (sig == SIGBUS) why = "SIGBUS";
+    DumpFirstStageKmsg(why, "?");
+    _exit(1);
+}
+
+static void InstallFirstStageCrashHandler() {
+    struct sigaction act = {};
+    act.sa_handler = FirstStageCrashHandler;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_RESETHAND;
+    sigaction(SIGSEGV, &act, nullptr);
+    sigaction(SIGABRT, &act, nullptr);
+    sigaction(SIGBUS, &act, nullptr);
+}
+#else
+// Release: hooks below compile to nothing and optimize out.
+static inline const char* P4rModeStr(const std::string&) {
+    return "?";
+}
+static inline void DumpFirstStageKmsg(const char*, const char*) {}
+static inline void InstallFirstStageCrashHandler() {}
+#endif
 
 void FreeRamdisk(DIR* dir, dev_t dev) {
     int dfd = dirfd(dir);
@@ -335,6 +434,10 @@ int FirstStageMain(int argc, char** argv) {
         InstallRebootSignalHandlers();
     }
 
+    InstallFirstStageCrashHandler();
+    // p4rOS: entry marker while /dev is still kernel devtmpfs (sda11 visible);
+    // proves init was even exec'd on this boot path.
+    DumpFirstStageKmsg("entry", "?");
     boot_clock::time_point start_time = boot_clock::now();
 
     std::vector<std::pair<std::string, int>> errors;
@@ -418,10 +521,16 @@ int FirstStageMain(int argc, char** argv) {
         for (const auto& [error_string, error_errno] : errors) {
             LOG(ERROR) << error_string << " " << strerror(error_errno);
         }
+#ifdef P4R_BRINGUP_DEBUG
+        // p4rOS bringup: don't abort; log and continue to expose the real failure.
+        LOG(ERROR) << "Init encountered errors starting first stage, continuing anyway (p4rOS)";
+#else
         LOG(FATAL) << "Init encountered errors starting first stage, aborting";
+#endif
     }
 
     LOG(INFO) << "init first stage started!";
+    DumpFirstStageKmsg("started", P4rModeStr(cmdline));
 
     auto old_root_dir = std::unique_ptr<DIR, decltype(&closedir)>{opendir("/"), closedir};
     if (!old_root_dir) {
@@ -441,8 +550,9 @@ int FirstStageMain(int argc, char** argv) {
     boot_clock::time_point module_start_time = boot_clock::now();
     int module_count = 0;
     BootMode boot_mode = GetBootMode(cmdline, bootconfig);
-    if (!LoadKernelModules(boot_mode, want_console,
-                           want_parallel, module_count)) {
+    DumpFirstStageKmsg("pre-modules", P4rModeStr(cmdline));
+    if (!LoadKernelModules(boot_mode, want_console, want_parallel_mode, want_parallel_test,
+                           module_count)) {
         if (want_console != FirstStageConsoleParam::DISABLED) {
             LOG(ERROR) << "Failed to load kernel modules, starting console";
         } else {
@@ -456,6 +566,7 @@ int FirstStageMain(int argc, char** argv) {
         LOG(INFO) << "Loaded " << module_count << " kernel modules took "
                   << module_elapse_time.count() << " ms";
     }
+    DumpFirstStageKmsg("post-modules", P4rModeStr(cmdline));
 
     MaybeResumeFromHibernation(bootconfig);
 
@@ -527,16 +638,20 @@ int FirstStageMain(int argc, char** argv) {
             fsm = CreateFirstStageMount(cmdline);
         }
         if (!fsm) {
+            DumpFirstStageKmsg("CreateFirstStageMount-null", P4rModeStr(cmdline));
             LOG(FATAL) << "FirstStageMount not available";
         }
 
         if (!created_devices && !fsm->DoCreateDevices()) {
+            DumpFirstStageKmsg("DoCreateDevices", P4rModeStr(cmdline));
             LOG(FATAL) << "Failed to create devices required for first stage mount";
         }
 
         if (!fsm->DoFirstStageMount()) {
+            DumpFirstStageKmsg("DoFirstStageMount", P4rModeStr(cmdline));
             LOG(FATAL) << "Failed to mount required partitions early ...";
         }
+        DumpFirstStageKmsg("post-mount", P4rModeStr(cmdline));
     }
 
     struct stat new_root_info {};
@@ -550,6 +665,62 @@ int FirstStageMain(int argc, char** argv) {
     }
 
     SetInitAvbVersionInRecovery();
+
+#ifdef P4R_BRINGUP_DEBUG
+    // Pre-exec sanity: if /system didn't mount, execv FATALs below. Record why.
+    {
+        bool ours = false;
+        int out = P4rOpenWitness("firststage_kmsg.txt", &ours);
+        if (out >= 0) {
+            dprintf(out, "\n===== first-stage[%s]: pre-exec sysinit=%d buildprop=%d =====\n",
+                    P4rModeStr(cmdline), access("/system/bin/init", X_OK),
+                    access("/system/build.prop", R_OK));
+            // Which second-stage candidates exist? + new-root listing.
+            static const char* cands[] = {"/bin/init",   "/init",
+                                          "/system/bin/init", "/system/system/bin/init",
+                                          "/build.prop", "/system/build.prop",
+                                          "/system/init", nullptr};
+            for (int i = 0; cands[i]; ++i) {
+                char cl[160];
+                int clen = snprintf(cl, sizeof(cl), "cand %s -> %d\n", cands[i],
+                                    access(cands[i], X_OK));
+                if (clen > 0) P4rWriteAll(out, cl, clen);
+            }
+            DIR* d = opendir("/");
+            if (d) {
+                const char rh[] = "--- root ls ---\n";
+                P4rWriteAll(out, rh, sizeof(rh) - 1);
+                struct dirent* de;
+                int n = 0;
+                while ((de = readdir(d)) && n < 60) {
+                    char el[280];
+                    int elen = snprintf(el, sizeof(el), "%s\n", de->d_name);
+                    if (elen > 0) P4rWriteAll(out, el, elen);
+                    ++n;
+                }
+                closedir(d);
+            }
+            int mfd = open("/proc/mounts", O_RDONLY);
+            if (mfd >= 0) {
+                const char mh[] = "--- mounts ---\n";
+                P4rWriteAll(out, mh, sizeof(mh) - 1);
+                char buf[4096];
+                ssize_t n;
+                int total = 0;
+                while ((n = read(mfd, buf, sizeof(buf))) > 0 && total < 8192) {
+                    P4rWriteAll(out, buf, n);
+                    total += n;
+                }
+                close(mfd);
+            } else {
+                const char nom[] = "--- no /proc/mounts ---\n";
+                P4rWriteAll(out, nom, sizeof(nom) - 1);
+            }
+            P4rCloseWitness(out, ours);
+        }
+        // Leave the mount; init's own FirstStageMount already ran.
+    }
+#endif
 
     setenv(kEnvFirstStageStartedAt, std::to_string(start_time.time_since_epoch().count()).c_str(),
            1);

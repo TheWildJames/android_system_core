@@ -247,6 +247,12 @@ cc_defaults {
         default: [],
     }),
     header_libs: ["bootimg_headers"],
+    // p4rOS bringup witness (userdebug/eng only; user builds get stock init).
+    product_variables: {
+        debuggable: {
+            cflags: ["-DP4R_BRINGUP_DEBUG"],
+        },
+    },
     proto: {
         type: "lite",
         export_proto_headers: true,
@@ -313,6 +319,12 @@ cc_binary {
     name: "init_second_stage",
     defaults: ["init_second_stage_defaults"],
     static_libs: ["libinit"],
+    // p4rOS bringup witness (userdebug/eng only; user builds get stock init).
+    product_variables: {
+        debuggable: {
+            cflags: ["-DP4R_BRINGUP_DEBUG"],
+        },
+    },
     visibility: ["//visibility:any_system_partition"],
     required: [
         "init.rc",
@@ -331,6 +343,12 @@ cc_binary {
     static_libs: ["libinit"],
     recovery: true,
     cflags: ["-DRECOVERY"],
+    // p4rOS bringup witness (userdebug/eng only; user builds get stock init).
+    product_variables: {
+        debuggable: {
+            cflags: ["-DP4R_BRINGUP_DEBUG"],
+        },
+    },
     exclude_static_libs: [
         "libxml2",
     ],
@@ -473,6 +491,9 @@ init_first_stage_cc_defaults {
 
                 "-UDUMP_ON_UMOUNT_FAILURE",
                 "-DDUMP_ON_UMOUNT_FAILURE=1",
+
+                // p4rOS bringup witness (userdebug/eng only; user builds get stock init).
+                "-DP4R_BRINGUP_DEBUG",
             ],
         },
 
